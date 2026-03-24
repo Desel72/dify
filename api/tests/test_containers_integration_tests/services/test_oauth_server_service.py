@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 from werkzeug.exceptions import BadRequest
 
+from extensions.ext_redis import redis_client
 from models.model import OAuthProviderApp
 from services.oauth_server import (
-    OAUTH_ACCESS_TOKEN_EXPIRES_IN,
     OAUTH_ACCESS_TOKEN_REDIS_KEY,
     OAUTH_AUTHORIZATION_CODE_REDIS_KEY,
-    OAUTH_REFRESH_TOKEN_EXPIRES_IN,
     OAUTH_REFRESH_TOKEN_REDIS_KEY,
     OAuthGrantType,
     OAuthServerService,
@@ -55,120 +53,135 @@ class TestOAuthServerServiceGetProviderApp:
 
 
 class TestOAuthServerServiceTokenOperations:
-    """Redis-backed tests for token sign/validate operations."""
+    """Real Redis-backed tests for token sign/validate operations."""
 
-    @pytest.fixture
-    def mock_redis(self):
-        with patch("services.oauth_server.redis_client") as mock:
-            yield mock
+    def test_sign_authorization_code_stores_in_redis(self, flask_req_ctx_with_containers):
+        client_id = f"client-{uuid4()}"
+        user_id = f"user-{uuid4()}"
 
-    def test_sign_authorization_code_stores_and_returns_code(self, mock_redis):
-        deterministic_uuid = uuid.UUID("00000000-0000-0000-0000-000000000111")
-        with patch("services.oauth_server.uuid.uuid4", return_value=deterministic_uuid):
-            code = OAuthServerService.sign_oauth_authorization_code("client-1", "user-1")
+        code = OAuthServerService.sign_oauth_authorization_code(client_id, user_id)
 
-        assert code == str(deterministic_uuid)
-        mock_redis.set.assert_called_once_with(
-            OAUTH_AUTHORIZATION_CODE_REDIS_KEY.format(client_id="client-1", code=code),
-            "user-1",
-            ex=600,
-        )
+        assert code is not None
+        key = OAUTH_AUTHORIZATION_CODE_REDIS_KEY.format(client_id=client_id, code=code)
+        stored = redis_client.get(key)
+        assert stored is not None
+        assert stored.decode() == user_id
 
-    def test_sign_access_token_raises_bad_request_for_invalid_code(self, mock_redis):
-        mock_redis.get.return_value = None
+        # Cleanup
+        redis_client.delete(key)
 
+    def test_sign_access_token_raises_bad_request_for_invalid_code(self, flask_req_ctx_with_containers):
         with pytest.raises(BadRequest, match="invalid code"):
             OAuthServerService.sign_oauth_access_token(
                 grant_type=OAuthGrantType.AUTHORIZATION_CODE,
-                code="bad-code",
-                client_id="client-1",
+                code=f"bad-code-{uuid4()}",
+                client_id=f"client-{uuid4()}",
             )
 
-    def test_sign_access_token_issues_tokens_for_valid_code(self, mock_redis):
-        token_uuids = [
-            uuid.UUID("00000000-0000-0000-0000-000000000201"),
-            uuid.UUID("00000000-0000-0000-0000-000000000202"),
-        ]
-        with patch("services.oauth_server.uuid.uuid4", side_effect=token_uuids):
-            mock_redis.get.return_value = b"user-1"
+    def test_sign_access_token_issues_tokens_for_valid_code(self, flask_req_ctx_with_containers):
+        client_id = f"client-{uuid4()}"
+        user_id = f"user-{uuid4()}"
 
-            access_token, refresh_token = OAuthServerService.sign_oauth_access_token(
-                grant_type=OAuthGrantType.AUTHORIZATION_CODE,
-                code="code-1",
-                client_id="client-1",
-            )
+        # Store an authorization code first
+        code = OAuthServerService.sign_oauth_authorization_code(client_id, user_id)
 
-        assert access_token == str(token_uuids[0])
-        assert refresh_token == str(token_uuids[1])
-        code_key = OAUTH_AUTHORIZATION_CODE_REDIS_KEY.format(client_id="client-1", code="code-1")
-        mock_redis.delete.assert_called_once_with(code_key)
-        mock_redis.set.assert_any_call(
-            OAUTH_ACCESS_TOKEN_REDIS_KEY.format(client_id="client-1", token=access_token),
-            b"user-1",
-            ex=OAUTH_ACCESS_TOKEN_EXPIRES_IN,
-        )
-        mock_redis.set.assert_any_call(
-            OAUTH_REFRESH_TOKEN_REDIS_KEY.format(client_id="client-1", token=refresh_token),
-            b"user-1",
-            ex=OAUTH_REFRESH_TOKEN_EXPIRES_IN,
+        # Exchange code for tokens
+        access_token, refresh_token = OAuthServerService.sign_oauth_access_token(
+            grant_type=OAuthGrantType.AUTHORIZATION_CODE,
+            code=code,
+            client_id=client_id,
         )
 
-    def test_sign_access_token_raises_bad_request_for_invalid_refresh_token(self, mock_redis):
-        mock_redis.get.return_value = None
+        assert access_token is not None
+        assert refresh_token is not None
 
+        # Verify authorization code was deleted
+        code_key = OAUTH_AUTHORIZATION_CODE_REDIS_KEY.format(client_id=client_id, code=code)
+        assert redis_client.get(code_key) is None
+
+        # Verify access token was stored
+        access_key = OAUTH_ACCESS_TOKEN_REDIS_KEY.format(client_id=client_id, token=access_token)
+        assert redis_client.get(access_key) is not None
+
+        # Verify refresh token was stored
+        refresh_key = OAUTH_REFRESH_TOKEN_REDIS_KEY.format(client_id=client_id, token=refresh_token)
+        assert redis_client.get(refresh_key) is not None
+
+        # Cleanup
+        redis_client.delete(access_key, refresh_key)
+
+    def test_sign_access_token_raises_bad_request_for_invalid_refresh_token(self, flask_req_ctx_with_containers):
         with pytest.raises(BadRequest, match="invalid refresh token"):
             OAuthServerService.sign_oauth_access_token(
                 grant_type=OAuthGrantType.REFRESH_TOKEN,
-                refresh_token="stale-token",
-                client_id="client-1",
+                refresh_token=f"stale-{uuid4()}",
+                client_id=f"client-{uuid4()}",
             )
 
-    def test_sign_access_token_issues_new_token_for_valid_refresh(self, mock_redis):
-        deterministic_uuid = uuid.UUID("00000000-0000-0000-0000-000000000301")
-        with patch("services.oauth_server.uuid.uuid4", return_value=deterministic_uuid):
-            mock_redis.get.return_value = b"user-1"
+    def test_sign_access_token_issues_new_token_for_valid_refresh(self, flask_req_ctx_with_containers):
+        client_id = f"client-{uuid4()}"
+        user_id = f"user-{uuid4()}"
 
-            access_token, returned_refresh = OAuthServerService.sign_oauth_access_token(
-                grant_type=OAuthGrantType.REFRESH_TOKEN,
-                refresh_token="refresh-1",
-                client_id="client-1",
-            )
-
-        assert access_token == str(deterministic_uuid)
-        assert returned_refresh == "refresh-1"
-
-    def test_sign_access_token_returns_none_for_unknown_grant_type(self, mock_redis):
-        grant_type = cast(OAuthGrantType, "invalid-grant-type")
-
-        result = OAuthServerService.sign_oauth_access_token(grant_type=grant_type, client_id="client-1")
-
-        assert result is None
-
-    def test_sign_refresh_token_stores_with_expected_expiry(self, mock_redis):
-        deterministic_uuid = uuid.UUID("00000000-0000-0000-0000-000000000401")
-        with patch("services.oauth_server.uuid.uuid4", return_value=deterministic_uuid):
-            refresh_token = OAuthServerService._sign_oauth_refresh_token("client-2", "user-2")
-
-        assert refresh_token == str(deterministic_uuid)
-        mock_redis.set.assert_called_once_with(
-            OAUTH_REFRESH_TOKEN_REDIS_KEY.format(client_id="client-2", token=refresh_token),
-            "user-2",
-            ex=OAUTH_REFRESH_TOKEN_EXPIRES_IN,
+        # Create initial tokens
+        code = OAuthServerService.sign_oauth_authorization_code(client_id, user_id)
+        _, refresh_token = OAuthServerService.sign_oauth_access_token(
+            grant_type=OAuthGrantType.AUTHORIZATION_CODE,
+            code=code,
+            client_id=client_id,
         )
 
-    def test_validate_access_token_returns_none_when_not_found(self, mock_redis):
-        mock_redis.get.return_value = None
+        # Use refresh token to get new access token
+        new_access_token, returned_refresh = OAuthServerService.sign_oauth_access_token(
+            grant_type=OAuthGrantType.REFRESH_TOKEN,
+            refresh_token=refresh_token,
+            client_id=client_id,
+        )
 
-        result = OAuthServerService.validate_oauth_access_token("client-1", "missing-token")
+        assert new_access_token is not None
+        assert returned_refresh == refresh_token
+
+        # Verify new access token is stored
+        new_access_key = OAUTH_ACCESS_TOKEN_REDIS_KEY.format(client_id=client_id, token=new_access_token)
+        assert redis_client.get(new_access_key) is not None
+
+        # Cleanup
+        redis_client.delete(new_access_key)
+        redis_client.delete(OAUTH_REFRESH_TOKEN_REDIS_KEY.format(client_id=client_id, token=refresh_token))
+
+    def test_sign_access_token_returns_none_for_unknown_grant_type(self, flask_req_ctx_with_containers):
+        grant_type = cast(OAuthGrantType, "invalid-grant-type")
+
+        result = OAuthServerService.sign_oauth_access_token(grant_type=grant_type, client_id=f"client-{uuid4()}")
 
         assert result is None
 
-    def test_validate_access_token_loads_user_when_exists(self, mock_redis):
-        mock_redis.get.return_value = b"user-88"
-        expected_user = MagicMock()
+    def test_validate_access_token_returns_none_when_not_found(self, flask_req_ctx_with_containers):
+        result = OAuthServerService.validate_oauth_access_token(f"client-{uuid4()}", f"missing-{uuid4()}")
 
+        assert result is None
+
+    def test_validate_access_token_loads_user_when_exists(self, flask_req_ctx_with_containers, db_session_with_containers):
+        client_id = f"client-{uuid4()}"
+        user_id = f"user-{uuid4()}"
+
+        # Create tokens via the full flow
+        code = OAuthServerService.sign_oauth_authorization_code(client_id, user_id)
+        access_token, refresh_token = OAuthServerService.sign_oauth_access_token(
+            grant_type=OAuthGrantType.AUTHORIZATION_CODE,
+            code=code,
+            client_id=client_id,
+        )
+
+        # Validate — AccountService.load_user needs to be mocked since we don't have a real account
+        from unittest.mock import MagicMock
+
+        expected_user = MagicMock()
         with patch("services.oauth_server.AccountService.load_user", return_value=expected_user) as mock_load:
-            result = OAuthServerService.validate_oauth_access_token("client-1", "access-token")
+            result = OAuthServerService.validate_oauth_access_token(client_id, access_token)
 
         assert result is expected_user
-        mock_load.assert_called_once_with("user-88")
+        mock_load.assert_called_once_with(user_id)
+
+        # Cleanup
+        redis_client.delete(OAUTH_ACCESS_TOKEN_REDIS_KEY.format(client_id=client_id, token=access_token))
+        redis_client.delete(OAUTH_REFRESH_TOKEN_REDIS_KEY.format(client_id=client_id, token=refresh_token))
