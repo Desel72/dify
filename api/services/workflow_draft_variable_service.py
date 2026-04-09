@@ -800,8 +800,8 @@ class DraftVariableSaver:
     # technical variables from being exposed in the draft environment, particularly those
     # that aren't meant to be directly edited or viewed by users.
     _EXCLUDE_VARIABLE_NAMES_MAPPING: dict[NodeType, frozenset[str]] = {
-        BuiltinNodeTypes.LLM: frozenset(["finish_reason"]),
-        BuiltinNodeTypes.LOOP: frozenset(["loop_round"]),
+        BuiltinNodeTypes.LLM: frozenset(("finish_reason",)),
+        BuiltinNodeTypes.LOOP: frozenset(("loop_round",)),
     }
 
     # Database session used for persisting draft variables.
@@ -1075,9 +1075,8 @@ class DraftVariableSaver:
         )
         engine = bind = self._session.get_bind()
         assert isinstance(engine, Engine)
-        with Session(bind=engine, expire_on_commit=False) as session:
+        with sessionmaker(bind=engine, expire_on_commit=False).begin() as session:
             session.add(variable_file)
-            session.commit()
 
         return truncation_result.result, variable_file
 
